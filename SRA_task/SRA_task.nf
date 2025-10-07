@@ -63,8 +63,8 @@ process FASTQC {
         path inputfile
     
     output:
-        path "${inputfile.getSimpleName()}_fastqc.zip"        //path "*_fastqc.{zip,html}", emit: fastqc_results
-        path "${inputfile.getSimpleName()}_fastqc.html" 
+        path "${inputfile.getSimpleName()}_fastqc.zip", emit: fastqc_zip        //path "*_fastqc.{zip,html}", emit: fastqc_results
+        path "${inputfile.getSimpleName()}_fastqc.html", emit: fastqc_html
 
     """
     fastqc ${inputfile}
@@ -81,9 +81,9 @@ process trimming {
     
     output: 
         
-        //path "${inputfile.getSimpleName()}_trimmed.fastq"
+        path "${inputfile.getSimpleName()}_trimmed.fastq", emit: trimmed_fastq   
         //path "${inputfile.getSimpleName()}_trimmed.html"   
-        path "${inputfile.getSimpleName()}_trimmed.json"  
+        path "${inputfile.getSimpleName()}_trimmed.json", emit: json_report  
 
     """
     fastp \
@@ -117,6 +117,50 @@ process trimming {
           --average_qual ${params.average_quality}
 */
 
+    process spades {
+    container "https://depot.galaxyproject.org/singularity/spades%3A4.2.0--haf24da9_0"
+    publishDir "${projectDir}/FASTQ_files/spades", mode:'copy', overwrite:true
+
+    input:
+        path inputfile  // trimmed fastq
+
+    output:
+        path "${inputfile.getSimpleName()}_assembly", emit: assembly_dir
+        path "${inputfile.getSimpleName()}_assembly/contigs.fasta", emit: contigs
+    """
+    spades.py -s "${inputfile}" -o ${inputfile.getSimpleName()}_assembly --isolate
+    """
+    }
+
+    process bandage {
+    container "https://depot.galaxyproject.org/singularity/bandage%3A0.9.0--h9948957_0"
+    publishDir "${projectDir}/FASTQ_files/spades/bandage", mode:'copy', overwrite:true
+
+    input:
+        path inputfile  // assembly dir contains fastg
+
+    output:
+        path "${inputfile.getSimpleName()}_assembly_graph.png"
+    """
+    Bandage image ${inputfile}/assembly_graph.fastg ${inputfile.getSimpleName()}_assembly_graph.png
+    """
+    }
+
+    process QUAST {
+    container "https://depot.galaxyproject.org/singularity/quast%3A5.3.0--py313pl5321h5ca1c30_2"
+    publishDir "${projectDir}/FASTQ_files/spades/quast_QC", mode:'copy', overwrite:true
+
+    input:
+        path inputfile  // takes fasta file
+
+    output:
+         path "quast_output/report.html", emit: quast_html
+         path "quast_output", emit: quast_dir
+    """
+    quast.py "${inputfile}" -o quast_output
+    """
+    }
+
 workflow {  
     accession_ch = Channel.fromPath(params.accession).splitText().map { it.trim() }
     prefetch_sra_ch = prefetch_sra(accession_ch)
@@ -127,11 +171,30 @@ workflow {
     stats(FASTQ_dump_ch)
         // This process is now conditional based on the --with_fastqc parameter
     if (params.with_fastqc) {
-        FASTQC(FASTQ_dump_ch)
+        fastqc_ch = FASTQC(FASTQ_dump_ch)
     }
+    fastqc_report_ch = fastqc_ch.fastqc_html 
 
     trim_ch = trimming(FASTQ_dump_ch)
-    multiQC(trim_ch.collect())
+    // from emit
+    trimmed_fastq_ch = trim_ch.trimmed_fastq
+    trimmed_json_ch = trim_ch.json_report
+
+    
+
+    spades_ch = spades(trimmed_fastq_ch)
+    // from emit
+    assembly_dir_ch = spades_ch.assembly_dir     // contains .fastg and more
+    contigs_ch = spades_ch.contigs        // contains .fasta
+    
+    bandage(assembly_dir_ch)
+
+    QUAST_ch = QUAST(contigs_ch)
+    // 1. Initialize the combined channel with the first report channel (Fix #2)
+    all_reports_ch = fastqc_report_ch
+    all_reports_ch = all_reports_ch.mix(trimmed_json_ch, QUAST_ch)
+    multiQC_ch = all_reports_ch.collect()
+    multiQC(multiQC_ch)
 
     
 }    
